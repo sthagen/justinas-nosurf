@@ -151,42 +151,209 @@ func TestContextIsAccessible(t *testing.T) {
 	hand.ServeHTTP(writer, req)
 }
 
-func TestEmptyRefererFails(t *testing.T) {
-	hand := New(http.HandlerFunc(succHand))
-	fhand := correctReason(t, ErrNoReferer)
-	hand.SetFailureHandler(fhand)
-
-	req, err := http.NewRequest("POST", "https://dummy.us/", strings.NewReader("a=b"))
-	if err != nil {
-		t.Fatal(err)
+func TestRefererHandling(t *testing.T) {
+	const host = "example.com"
+	var allowedOrigins = []string{"https://api.example.com", "http://example.org"}
+	testCases := []struct {
+		name         string
+		isTLS        bool
+		referer      string
+		origin       string
+		secFetchSite string
+		expectReason error
+	}{
+		{
+			name:         "no Referer nor Origin fails on secure requests",
+			isTLS:        true,
+			expectReason: ErrNoReferer,
+		},
+		{
+			name:         "identical secure Referer passes",
+			isTLS:        true,
+			referer:      "https://example.com",
+			expectReason: nil,
+		},
+		{
+			name:         "differing Referer fails when Origin is absent",
+			isTLS:        true,
+			referer:      "https://attacker.lol",
+			expectReason: ErrBadReferer,
+		},
+		{
+			name:         "mismatched Referer scheme fails when Origin is absent",
+			isTLS:        true,
+			referer:      "http://example.com",
+			expectReason: ErrBadReferer,
+		},
+		{
+			name:         "mismatched Referer fails on insecure requests",
+			isTLS:        false,
+			referer:      "https://attacker.lol",
+			expectReason: ErrBadReferer,
+		},
+		{
+			name:         "mismatched Origin fails on insecure requests",
+			isTLS:        false,
+			origin:       "http://attacker.lol",
+			expectReason: ErrBadOrigin,
+		},
+		{
+			name:         "mismatched Origin fails on secure requests",
+			isTLS:        false,
+			origin:       "http://attacker.lol",
+			referer:      "https://example.com",
+			expectReason: ErrBadOrigin,
+		},
+		{
+			name:         "mismatched Origin scheme fails on insecure requests",
+			isTLS:        false,
+			origin:       "https://example.com",
+			expectReason: ErrBadOrigin,
+		},
+		{
+			name:         "mismatched Origin scheme fails on insecure requests",
+			isTLS:        true,
+			origin:       "http://example.com",
+			expectReason: ErrBadOrigin,
+		},
+		{
+			name:         "matching Origin passes on insecure requests",
+			isTLS:        false,
+			origin:       "http://example.com",
+			expectReason: nil,
+		},
+		{
+			name:         "matching Origin passes on secure requests",
+			isTLS:        true,
+			origin:       "https://example.com",
+			expectReason: nil,
+		},
+		{
+			name:         "explicitly allowed insecure Origin passes",
+			isTLS:        false,
+			origin:       "http://example.org",
+			referer:      "http://attacker.lol",
+			expectReason: nil,
+		},
+		{
+			name:         "explicitly allowed insecure Origin passes, despite a secure request",
+			isTLS:        false,
+			origin:       "http://example.org",
+			referer:      "http://attacker.lol",
+			expectReason: nil,
+		},
+		{
+			name:         "explicitly allowed secure Origin passes",
+			isTLS:        true,
+			origin:       "https://api.example.com",
+			referer:      "http://attacker.lol",
+			expectReason: nil,
+		},
+		{
+			name:         "explicitly allowed insecure Origin passes, despite an insecure request",
+			isTLS:        false,
+			origin:       "https://api.example.com",
+			referer:      "http://attacker.lol",
+			expectReason: nil,
+		},
+		{
+			name:         "explicitly allowed Referer passes when Origin is absent",
+			isTLS:        true,
+			referer:      "http://example.org",
+			expectReason: nil,
+		},
+		{
+			name:         "Sec-Fetch-Site: same-origin is sufficient",
+			isTLS:        true,
+			secFetchSite: "same-origin",
+			expectReason: nil,
+		},
+		{
+			name:         "Sec-Fetch-Site: same-site does not pass",
+			isTLS:        true,
+			secFetchSite: "same-site",
+			expectReason: ErrNoReferer,
+		},
+		{
+			name:         "Sec-Fetch-Site: none does not pass",
+			isTLS:        true,
+			secFetchSite: "null",
+			expectReason: ErrNoReferer,
+		},
+		{
+			name:         "no origin headers present, secure request does not pass",
+			isTLS:        true,
+			expectReason: ErrNoReferer,
+		},
+		{
+			name:         "no origin headers present, insecure request does not pass",
+			isTLS:        false,
+			expectReason: ErrNoReferer,
+		},
 	}
-	writer := httptest.NewRecorder()
 
-	hand.ServeHTTP(writer, req)
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			hand := New(http.HandlerFunc(succHand))
+			fhand := correctReason(t, tc.expectReason)
+			hand.SetFailureHandler(fhand)
+			hand.SetIsTLSFunc(func(_ *http.Request) bool { return tc.isTLS })
+			origins, err := StaticOrigins(allowedOrigins...)
+			if err != nil {
+				t.Fatal(err)
+			}
+			hand.SetIsAllowedOriginFunc(origins)
 
-	if writer.Code != FailureCode {
-		t.Errorf("A POST request with no Referer should have failed with the code %d, but it didn't.",
-			writer.Code)
-	}
-}
+			server := httptest.NewServer(hand)
+			t.Cleanup(func() { server.Close() })
 
-func TestDifferentOriginRefererFails(t *testing.T) {
-	hand := New(http.HandlerFunc(succHand))
-	fhand := correctReason(t, ErrBadReferer)
-	hand.SetFailureHandler(fhand)
+			// Issue a GET to fetch the token
+			req, err := http.NewRequest(http.MethodGet, server.URL, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			req.Host = host
 
-	req, err := http.NewRequest("POST", "https://dummy.us/", strings.NewReader("a=b"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	req.Header.Set("Referer", "http://attack-on-golang.com")
-	writer := httptest.NewRecorder()
+			resp, err := server.Client().Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			cookie := getRespCookie(resp, CookieName)
 
-	hand.ServeHTTP(writer, req)
+			// Issue POST to check handling
+			finalToken := b64encode(maskToken(b64decode(cookie.Value)))
+			req, err = http.NewRequest("POST", server.URL, formBodyR([][]string{
+				{"name", "Jolene"},
+				{FormFieldName, finalToken},
+			}))
+			if err != nil {
+				t.Fatal(err)
+			}
+			req.Host = host
+			req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+			if tc.referer != "" {
+				req.Header.Set("Referer", tc.referer)
+			}
+			if tc.origin != "" {
+				req.Header.Set("Origin", tc.origin)
+			}
+			if tc.secFetchSite != "" {
+				req.Header.Set("Sec-Fetch-Site", tc.secFetchSite)
+			}
+			req.AddCookie(cookie)
+			resp, err = server.Client().Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
 
-	if writer.Code != FailureCode {
-		t.Errorf("A POST request with a Referer from a different origin"+
-			"should have failed with the code %d, but it didn't.", writer.Code)
+			if tc.expectReason == nil {
+				if resp.StatusCode != http.StatusOK {
+					t.Errorf("Expected request to succeed, but it failed with code %d", resp.StatusCode)
+				}
+			} else if resp.StatusCode != FailureCode {
+				t.Errorf("Expected request to fail with status code %d, but the status code was %d", FailureCode, resp.StatusCode)
+			}
+		})
 	}
 }
 
@@ -199,10 +366,12 @@ func TestNoTokenFails(t *testing.T) {
 		{"name", "Jolene"},
 	}
 
-	req, err := http.NewRequest("POST", "http://dummy.us", formBodyR(vals))
+	req, err := http.NewRequest("POST", "/", formBodyR(vals))
 	if err != nil {
 		panic(err)
 	}
+	req.Host = "example.com"
+	req.Header.Add("Referer", "https://example.com")
 	writer := httptest.NewRecorder()
 
 	hand.ServeHTTP(writer, req)
@@ -231,10 +400,12 @@ func TestWrongTokenFails(t *testing.T) {
 		{FormFieldName, "$#%^&"},
 	}
 
-	req, err := http.NewRequest("POST", "http://dummy.us", formBodyR(vals))
+	req, err := http.NewRequest("POST", "/", formBodyR(vals))
 	if err != nil {
 		panic(err)
 	}
+	req.Host = "example.com"
+	req.Header.Add("Referer", "https://example.com")
 	writer := httptest.NewRecorder()
 
 	hand.ServeHTTP(writer, req)
@@ -306,26 +477,26 @@ func TestCorrectTokenPasses(t *testing.T) {
 	}
 
 	// Test usual POST
-	/*
-		{
-			req, err := http.NewRequest("POST", server.URL, formBodyR(vals))
-			if err != nil {
-				t.Fatal(err)
-			}
-			req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-			req.AddCookie(cookie)
-
-			resp, err = http.DefaultClient.Do(req)
-
-			if err != nil {
-				t.Fatal(err)
-			}
-			if resp.StatusCode != 200 {
-				t.Errorf("The request should have succeeded, but it didn't. Instead, the code was %d",
-					resp.StatusCode)
-			}
+	{
+		req, err := http.NewRequest("POST", server.URL, formBodyR(vals))
+		if err != nil {
+			t.Fatal(err)
 		}
-	*/
+		req.Host = "example.com"
+		req.Header.Add("Referer", "https://example.com")
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		req.AddCookie(cookie)
+
+		resp, err = http.DefaultClient.Do(req)
+
+		if err != nil {
+			t.Fatal(err)
+		}
+		if resp.StatusCode != 200 {
+			t.Errorf("The request should have succeeded, but it didn't. Instead, the code was %d",
+				resp.StatusCode)
+		}
+	}
 
 	// Test multipart
 	{
@@ -357,7 +528,8 @@ func TestCorrectTokenPasses(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-
+		req.Host = "example.com"
+		req.Header.Add("Referer", "https://example.com")
 		req.Header.Add("Content-Type", wr.FormDataContentType())
 		req.AddCookie(cookie)
 
@@ -405,6 +577,8 @@ func TestPrefersHeaderOverFormValue(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	req.Host = "example.com"
+	req.Header.Add("Referer", "https://example.com")
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req.Header.Set(HeaderName, finalToken)
 	req.AddCookie(cookie)
